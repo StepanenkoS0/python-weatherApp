@@ -1,132 +1,117 @@
 import streamlit as st
 import pandas as pd
 import requests
-from model import train_model, predict_rain
+from datetime import datetime
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
 
-st.title("Прогноз опадів (Open-Meteo)")
+st.set_page_config(page_title="Weather ML Forecast", layout="centered")
+st.title("🌦 Прогноз опадів на основі ML")
 
-st.write("Координати за замовчуванням – Київ")
+# -------------------------------
+# Функції
+# -------------------------------
+def get_city_coordinates(city_name: str):
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {"q": city_name, "format": "json", "limit": 1}
+    headers = {"User-Agent": "weather-ml-app"}
+    r = requests.get(url, params=params, headers=headers)
+    data = r.json()
+    if not data:
+        return None, None
+    return float(data[0]["lat"]), float(data[0]["lon"])
 
-latitude = st.number_input("Latitude (широта)", value=50.45)
-longitude = st.number_input("Longitude (довгота)", value=30.52)
+def fetch_weather_data(lat, lon, start_date, end_date):
+    url = "https://archive-api.open-meteo.com/v1/archive"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "daily": "precipitation_sum,rain_sum,temperature_2m_max,temperature_2m_min,windspeed_10m_max",
+        "start_date": start_date,
+        "end_date": end_date,
+        "timezone": "auto"
+    }
+    r = requests.get(url, params=params)
+    df = pd.DataFrame(r.json()["daily"])
+    df["time"] = pd.to_datetime(df["time"])
+    df["rain_label"] = df["precipitation_sum"].apply(lambda x: 1 if x > 0 else 0)
+    return df
 
-start_date = st.text_input("Дата початку", "2023-01-01")
-end_date = st.text_input("Дата кінця", "2023-04-01")
+# -------------------------------
+# Введення даних користувачем
+# -------------------------------
+city_name = st.text_input("Введіть місто:", "Kyiv")
+start_date_input = st.text_input("Дата початку (YYYY-MM-DD):",
+                                 (datetime.now().replace(year=datetime.now().year-1)).strftime("%Y-%m-%d"))
+end_date_input = st.text_input("Дата кінця (YYYY-MM-DD):",
+                               datetime.now().strftime("%Y-%m-%d"))
 
-# =============================
-# Отримання даних
-# =============================
+# -------------------------------
+# Отримання координат
+# -------------------------------
+latitude, longitude = get_city_coordinates(city_name)
+if latitude is None:
+    st.error("Місто не знайдено")
+    st.stop()
 
-st.header("1. Отримання метеоданих")
+st.write(f"Координати {city_name}: {latitude:.2f}, {longitude:.2f}")
 
-if st.button("Отримати дані з Open-Meteo"):
+# -------------------------------
+# Завантаження історичних даних
+# -------------------------------
+if st.button("Отримати історичні дані"):
+    df_history = fetch_weather_data(latitude, longitude, start_date_input, end_date_input)
+    df_history.to_csv("weather_daily.csv", index=False)
+    st.session_state["data"] = df_history
 
-    url = f"https://archive-api.open-meteo.com/v1/archive?latitude={latitude}&longitude={longitude}&start_date={start_date}&end_date={end_date}&daily=precipitation_sum,rain_sum,temperature_2m_max,temperature_2m_min,wind_speed_10m_max&timezone=auto"
+    st.success(f"Дані отримані ({len(df_history)} днів)")
+    st.subheader("Останні записи")
+    st.dataframe(df_history.tail())
 
-    response = requests.get(url)
+    st.subheader("📈 Історичні опади")
+    st.line_chart(df_history.set_index("time")["precipitation_sum"])
 
-    data = response.json()
-
-    df = pd.DataFrame(data["daily"])
-
-    df.to_csv("weather_daily.csv", index=False)
-
-    st.success("Дані збережено у weather_daily.csv")
-
-    st.dataframe(df)
-
-# =============================
-# Завантаження CSV
-# =============================
-
-st.header("2. Завантаження CSV")
-
-uploaded_file = st.file_uploader("Завантаж CSV файл", type=["csv"])
-
-if uploaded_file is not None:
-
-    df = pd.read_csv(uploaded_file)
-
-    st.write("Завантажений датасет")
-
-    st.dataframe(df)
-
-# =============================
+# -------------------------------
 # Навчання моделі
-# =============================
+# -------------------------------
+if "data" in st.session_state:
+    df = st.session_state["data"]
+    features = ["rain_sum", "temperature_2m_max", "temperature_2m_min", "windspeed_10m_max"]
+    X = df[features]
+    y = df["rain_label"]
 
-st.header("3. Навчання моделі")
-
-if st.button("Навчити модель"):
-
-    with st.spinner("Навчання моделі..."):
-
-        if uploaded_file is not None:
-            df = pd.read_csv(uploaded_file)
-        else:
-            df = pd.read_csv("weather_daily.csv")
-
-        model, accuracy, report = train_model(df)
-
+    if st.button("Навчити модель"):
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        model = RandomForestClassifier()
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+        accuracy = accuracy_score(y_test, y_pred)
         st.session_state["model"] = model
-        st.session_state["data"] = df
+        st.session_state["accuracy"] = accuracy
+        st.success(f"Модель навчена. Точність: {accuracy*100:.2f}%")
 
-    st.success("Модель успішно навчена")
+        # Важливість ознак
+        st.subheader("Важливість факторів")
+        importance_df = pd.DataFrame({
+            "Фактор": features,
+            "Важливість": model.feature_importances_
+        }).sort_values(by="Важливість", ascending=False)
+        st.table(importance_df)
+        st.bar_chart(importance_df.set_index("Фактор"))
 
-    col1, col2 = st.columns(2)
+# -------------------------------
+# Прогноз на останній день періоду
+# -------------------------------
+if "model" in st.session_state:
+    st.subheader("Прогноз на останній день періоду")
+    df_future = st.session_state["data"].iloc[[-1]]  # беремо останній рядок
+    X_future = df_future[features]
+    model = st.session_state["model"]
+    prediction = model.predict(X_future)[0]
+    probability = model.predict_proba(X_future)[0][1]
 
-    with col1:
-        st.metric("Точність моделі", f"{accuracy:.2f}")
-
-    with col2:
-        st.metric("Кількість записів", len(df))
-
-    st.subheader("Звіт класифікації")
-
-    report_dict = {}
-
-    for line in report.split("\n")[2:-3]:
-
-        row = line.split()
-
-        if len(row) >= 4:
-
-            report_dict[row[0]] = {
-                "precision": row[1],
-                "recall": row[2],
-                "f1-score": row[3],
-            }
-
-    report_df = pd.DataFrame(report_dict).T
-
-    st.table(report_df)
-
-# =============================
-# Прогноз
-# =============================
-
-st.header("4. Прогноз опадів")
-
-if st.button("Зробити прогноз"):
-
-    if "model" not in st.session_state:
-
-        st.error("Спочатку потрібно навчити модель")
-
+    if prediction == 1:
+        st.success(f"Очікуються опади. Ймовірність: {probability*100:.1f}%")
     else:
-
-        model = st.session_state["model"]
-        df = st.session_state["data"]
-
-        last_row = df.iloc[-1][[
-            "temperature_2m_max",
-            "temperature_2m_min",
-            "wind_speed_10m_max"
-        ]].values
-
-        prediction, probability = predict_rain(model, last_row)
-
-        if prediction == 1:
-            st.success(f"Очікуються опади. Ймовірність: {probability:.2f}")
-        else:
-            st.success(f"Опадів не очікується. Ймовірність: {probability:.2f}")
+        st.success(f"Опадів не очікується. Ймовірність: {probability*100:.1f}%")
